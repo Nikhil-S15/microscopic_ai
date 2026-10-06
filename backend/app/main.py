@@ -1,334 +1,238 @@
 """
-FASTAPI MAIN - WITH CLASSIFICATION + DETECTION (2-STEP PIPELINE)
-Step 1: /api/v1/classify  → 7-class bacteria identification (Keras .h5 model)
-Step 2: /api/v1/detect    → bounding box detection (species-specific PyTorch models)
-"""
-import sys
-import io as _io
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-import uuid
-from datetime import datetime
-import numpy as np
-import cv2
-import time
+FASTAPI MAIN — BACTERIA DETECTION
+=================================
+Detection: unified_bacteria_model.pth (one ResNet50) gated by noisy_background_model.pth.
 
-import torch
-from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+The API reports *whether* bacteria are present and where — never which organism.
+The model's internal class labels are used only inside the detector and are
+stripped from every response.
+
+Endpoints
+  GET  /health
+  GET  /api/v2/model                  model metadata
+  POST /api/v2/analyze                one image   → detections + result
+  POST /api/v2/analyze/batch          many images → per-image results + summary
+  GET  /api/v2/progress/{request_id}  live progress (0-1) of an analyze call
+"""
+import io as _io
+import threading
+import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image as PILImage
 
-sys.path.append(str(Path(__file__).parent))
-
-from app.inference import BacteriaDetector
-from app.utils import setup_logger, validate_image
+from app.unified import UnifiedDetector
+from app.utils import setup_logger
 
 logger = setup_logger(__name__)
 
-# ── Globals ───────────────────────────────────────────────────────────────────
-bacteria_detector = None
-classifier_model  = None
+MODEL_DIR       = Path(__file__).parent / "model"
+UNIFIED_PATH    = MODEL_DIR / "unified_bacteria_model.pth"
+NOISE_PATH      = MODEL_DIR / "noisy_background_model.pth"
+MAX_BATCH       = 50
+MAX_IMAGE_BYTES = 40 * 1024 * 1024
+HIGH_CONFIDENCE = 0.95
 
-# ── Class metadata ────────────────────────────────────────────────────────────
-CLASS_NAMES = [
-    "Acenetobacter_Preprocessed",
-    "Aspergillus_Preprocessed",
-    "Aureus_Preprocessed",
-    "Bulkoder_Preprocessed",
-    "Candida_Preprocessed",
-    "Klebsiella_Preprocessed",
-    "Pluribacter_Preprocessed",
-]
+detector: Optional[UnifiedDetector] = None
+inference_lock = threading.Lock()      # torch already uses every core
+progress: Dict[str, Dict[str, Any]] = {}
 
-CLASS_INFO = {
-    "Acenetobacter_Preprocessed": {"color": "#ef4444", "risk": "High",   "gram": "Gram-negative", "shape": "Coccobacillus", "display": "Acinetobacter"},
-    "Aspergillus_Preprocessed":   {"color": "#f97316", "risk": "Medium", "gram": "Fungal mold",   "shape": "Filamentous",   "display": "Aspergillus"},
-    "Aureus_Preprocessed":        {"color": "#eab308", "risk": "High",   "gram": "Gram-positive", "shape": "Coccus",        "display": "Staphylococcus Aureus"},
-    "Bulkoder_Preprocessed":      {"color": "#22c55e", "risk": "High",   "gram": "Gram-negative", "shape": "Rod",           "display": "Burkholderia"},
-    "Candida_Preprocessed":       {"color": "#06b6d4", "risk": "Medium", "gram": "Fungal yeast",  "shape": "Oval",          "display": "Candida"},
-    "Klebsiella_Preprocessed":    {"color": "#8b5cf6", "risk": "High",   "gram": "Gram-negative", "shape": "Rod",           "display": "Klebsiella"},
-    "Pluribacter_Preprocessed":   {"color": "#ec4899", "risk": "Low",    "gram": "Gram-negative", "shape": "Rod",           "display": "Pluribacter"},
-}
 
-# ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global bacteria_detector, classifier_model
-
-    logger.info("=" * 70)
-    logger.info("🦠 Bacteria Detection API — 2-Step Pipeline")
-    logger.info("=" * 70)
-
-    # Load PyTorch detection models
+    global detector
     try:
-        model_path = Path("app/model/final(tool)_best_model_fixed.pth")
-        if not model_path.exists():
-            raise FileNotFoundError(f"Detection model not found: {model_path}")
-        bacteria_detector = BacteriaDetector(
-            model_path=str(model_path),
-            patch_size=48,
-            device="cuda" if torch.cuda.is_available() else "cpu",
-        )
-        logger.info(f"✅ Detection models loaded on {bacteria_detector.device}")
+        detector = UnifiedDetector(str(UNIFIED_PATH), str(NOISE_PATH))
+        logger.info(f"Detector ready on {detector.device}")
     except Exception as e:
-        logger.error(f"❌ Detection model failed: {e}")
-        bacteria_detector = None
-
-    # Load Keras classifier
-    try:
-        import keras
-        cls_path = Path("app/model/bacteria_cnn_6class_model (1).h5")
-        if not cls_path.exists():
-            raise FileNotFoundError(f"Classifier model not found: {cls_path}")
-        classifier_model = keras.saving.load_model(str(cls_path), compile=False)
-        logger.info(f"✅ Classifier model loaded from {cls_path}")
-    except Exception as e:
-        logger.warning(f"⚠️  Classifier model not loaded: {e}")
-        classifier_model = None
-
+        logger.error(f"Detector failed to load: {e}")
+        detector = None
     yield
-    logger.info("Shutting down...")
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Bacteria Detection API — 2-Step Pipeline",
-    description="Step 1: classify bacteria type. Step 2: detect with bounding boxes.",
-    version="2.0.0",
+    title="Microscopy AI — Bacteria Detection API",
+    description="Detects bacteria in microscope images and reports their locations and confidence.",
+    version="4.0.0",
     lifespan=lifespan,
 )
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-# ── Pydantic models ───────────────────────────────────────────────────────────
-class ClassPrediction(BaseModel):
-    class_id: int
-    class_name: str
-    probability: float
-    color: str
-    risk_level: str
-    gram_type: str
-    shape: str
+# ── helpers ───────────────────────────────────────────────────────────────────
 
-class ClassifyResponse(BaseModel):
-    success: bool
-    predicted_class: str
-    predicted_class_id: int
-    confidence: float
-    all_predictions: List[ClassPrediction]
-    color: str
-    risk_level: str
-    gram_type: str
-    shape: str
-    processing_time: float
-
-class TopProbability(BaseModel):
-    class_id: int
-    class_name: str
-    probability: float
-
-class DetectionResult(BaseModel):
-    bbox: List[int]
-    class_id: int
-    class_name: str
-    confidence: float
-    top_probabilities: List[TopProbability]
-
-class InferenceResponse(BaseModel):
-    success: bool = True
-    request_id: str
-    timestamp: str
-    image_dimensions: Dict[str, int]
-    total_detections: int
-    detections: List[DetectionResult]
-    processing_time: float
-    overall_top_probabilities: List[TopProbability]
-    settings: Dict[str, Any]
-
-class HealthResponse(BaseModel):
-    status: str
-    detection_model_loaded: bool
-    classifier_model_loaded: bool
-    device: str
-    timestamp: str
+def decode_image(data: bytes) -> np.ndarray:
+    if not data:
+        raise ValueError("Empty file")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ValueError("Image larger than 40 MB")
+    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        try:
+            pil = PILImage.open(_io.BytesIO(data)).convert("RGB")
+        except Exception:
+            raise ValueError("Unsupported or corrupt image")
+        img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    return img
 
 
-# ── STEP 1: CLASSIFY ─────────────────────────────────────────────────────────
-@app.post("/api/v1/classify", response_model=ClassifyResponse, tags=["Step 1 - Classification"])
-async def classify_bacteria(file: UploadFile = File(...)):
-    """Identify which bacteria species is present."""
-    if classifier_model is None:
-        raise HTTPException(status_code=503, detail="Classifier model not loaded")
+def public_result(raw: Dict) -> Dict:
+    """Strip organism identity from the detector output; keep detection metrics."""
+    dets = [{"id": d["id"], "bbox": d["bbox"], "confidence": d["confidence"]} for d in raw["detections"]]
+    confs = [d["confidence"] for d in dets]
+    w, h = raw["image"]["width"], raw["image"]["height"]
+    covered = np.zeros((h, w), bool)
+    for d in dets:
+        x1, y1, x2, y2 = d["bbox"]
+        covered[max(0, y1):y2, max(0, x1):x2] = True
+    stats = raw["stats"]
+    return {
+        "bacteria_detected": bool(dets),
+        "total_detections": len(dets),
+        "detections": dets,
+        "confidence": {
+            "mean": round(float(np.mean(confs)), 4) if confs else None,
+            "max": round(float(np.max(confs)), 4) if confs else None,
+            "min": round(float(np.min(confs)), 4) if confs else None,
+            "high_confidence_share": round(float(np.mean(np.array(confs) >= HIGH_CONFIDENCE)), 4) if confs else None,
+        },
+        "coverage": round(float(covered.mean()), 6),
+        "image": raw["image"],
+        "stats": {
+            "windows_total": stats["windows_total"],
+            "windows_skipped": stats["windows_flat_skipped"] + stats["windows_noise_skipped"],
+            "windows_analysed": stats["windows_classified"],
+            "raw_hits": int(sum(stats["raw_candidates"].values())),
+        },
+        "processing_time": raw["processing_time"],
+    }
 
-    start = time.time()
+
+def run_analysis(data: bytes, filename: str, request_id: str, sensitivity: float, noise_gate: bool) -> Dict:
+    progress[request_id] = {"status": "queued", "progress": 0.0, "updated": time.time()}
+
+    def on_progress(p: float):
+        progress[request_id].update(status="analyzing", progress=round(p, 3), updated=time.time())
+
+    started = datetime.now()
     try:
-        contents = await file.read()
-
-        nparr   = np.frombuffer(contents, np.uint8)
-        img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            pil_img = PILImage.open(_io.BytesIO(contents)).convert("RGB")
-            img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-        # Smart preprocessing — auto-detect dark vs bright image
-        gray     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        mean_val = gray.mean()
-        if mean_val > 127:
-            # Bright background → invert so bacteria = white, background = black
-            gray = cv2.bitwise_not(gray)
-            logger.info(f"Bright image (mean={mean_val:.1f}) → inverted")
-        else:
-            logger.info(f"Dark image (mean={mean_val:.1f}) → no inversion")
-
-        resized = cv2.resize(gray, (128, 128))
-        arr     = resized.astype(np.float32) / 255.0
-        arr     = arr.reshape(1, 128, 128, 1)
-        logger.info(f"Classifier input: mean={arr.mean():.4f}")
-
-        preds     = classifier_model(arr, training=False).numpy()[0]
-        pred_idx  = int(np.argmax(preds))
-        pred_key  = CLASS_NAMES[pred_idx]
-        info      = CLASS_INFO[pred_key]
-        pred_name = info.get("display", pred_key)
-
-        all_preds = []
-        for i, (key, prob) in enumerate(zip(CLASS_NAMES, preds.tolist())):
-            ci = CLASS_INFO[key]
-            all_preds.append(ClassPrediction(
-                class_id=i,
-                class_name=ci.get("display", key),
-                probability=float(prob),
-                color=ci["color"],
-                risk_level=ci["risk"],
-                gram_type=ci["gram"],
-                shape=ci["shape"],
-            ))
-        all_preds.sort(key=lambda x: x.probability, reverse=True)
-
-        logger.info(f"✅ Classified as '{pred_name}' ({preds[pred_idx]*100:.1f}%)")
-
-        return ClassifyResponse(
-            success=True,
-            predicted_class=pred_name,
-            predicted_class_id=pred_idx,
-            confidence=float(preds[pred_idx]),
-            all_predictions=all_preds,
-            color=info["color"],
-            risk_level=info["risk"],
-            gram_type=info["gram"],
-            shape=info["shape"],
-            processing_time=time.time() - start,
-        )
-
+        img = decode_image(data)
+        with inference_lock:
+            progress[request_id].update(status="analyzing", updated=time.time())
+            raw = detector.detect(img, sensitivity=sensitivity, use_noise_gate=noise_gate,
+                                  progress_cb=on_progress)
+        progress[request_id].update(status="done", progress=1.0, updated=time.time())
+        return {
+            "success": True,
+            "request_id": request_id,
+            "filename": filename,
+            "timestamp": started.isoformat(),
+            **public_result(raw),
+        }
+    except ValueError as e:
+        progress[request_id].update(status="error", updated=time.time())
+        return {"success": False, "request_id": request_id, "filename": filename,
+                "error": str(e), "error_type": "input"}
     except Exception as e:
-        logger.error(f"Classification error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Analysis failed for {filename}")
+        progress[request_id].update(status="error", updated=time.time())
+        return {"success": False, "request_id": request_id, "filename": filename,
+                "error": f"Analysis failed: {e}", "error_type": "server"}
+    finally:
+        cutoff = time.time() - 600
+        for k in [k for k, v in progress.items() if v["updated"] < cutoff]:
+            progress.pop(k, None)
 
 
-# ── STEP 2: DETECT ────────────────────────────────────────────────────────────
-@app.post("/api/v1/detect", response_model=InferenceResponse, tags=["Step 2 - Detection"])
-async def detect_bacteria(
-    file:                 UploadFile = File(...),
-    confidence_threshold: float      = Query(0.75),
-    nms_threshold:        float      = Query(0.3),
-    use_tta:              bool       = Query(True),
-    top_k:                int        = Query(3),
-    species_name:         str        = Query(None),
+def require_detector():
+    if detector is None:
+        raise HTTPException(503, "Detection model not loaded")
+
+
+# ── endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/health", tags=["System"])
+def health():
+    return {
+        "status": "healthy" if detector else "unavailable",
+        "detector_loaded": detector is not None,
+        "device": str(detector.device) if detector else None,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/api/v2/model", tags=["System"])
+def model_info():
+    require_detector()
+    return {
+        "name": "Bacteria Detector",
+        "architecture": "ResNet50 · sliding-window patch classifier",
+        "device": str(detector.device),
+        "noise_gate": detector.noise_model is not None,
+        "high_confidence": HIGH_CONFIDENCE,
+        "limits": {"max_batch": MAX_BATCH, "max_image_mb": MAX_IMAGE_BYTES // (1024 * 1024)},
+    }
+
+
+@app.post("/api/v2/analyze", tags=["Analysis"])
+def analyze(
+    file: UploadFile = File(...),
+    request_id: Optional[str] = Form(None),
+    sensitivity: float = Form(0.0, ge=-0.2, le=0.3),
+    noise_gate: bool = Form(True),
 ):
-    """Draw bounding boxes around individual bacteria using the species-specific model."""
-    if bacteria_detector is None:
-        raise HTTPException(status_code=503, detail="Detection model not loaded")
-
-    try:
-        request_id = str(uuid.uuid4())
-        start_time = datetime.now()
-
-        contents = await file.read()
-        image    = validate_image(contents)
-        if image is None:
-            raise HTTPException(status_code=400, detail="Invalid image")
-
-        logger.info(f"Detecting species: {species_name or 'generic'}")
-
-        detections, overall_probs, proc_time = bacteria_detector.detect(
-            image,
-            confidence_threshold=confidence_threshold,
-            nms_threshold=nms_threshold,
-            use_tta=use_tta,
-            top_k=top_k,
-            species_name=species_name,
-        )
-
-        detection_results = []
-        for det in detections:
-            top_probs = [
-                TopProbability(
-                    class_id=p["class_id"],
-                    class_name=p["class_name"],
-                    probability=p["probability"],
-                ) for p in det["top_probabilities"]
-            ]
-            detection_results.append(DetectionResult(
-                bbox=det["bbox"],
-                class_id=det["class_id"],
-                class_name=det["class_name"],
-                confidence=det["confidence"],
-                top_probabilities=top_probs,
-            ))
-
-        overall_prob_results = [
-            TopProbability(
-                class_id=p["class_id"],
-                class_name=p["class_name"],
-                probability=p["probability"],
-            ) for p in overall_probs
-        ]
-
-        total_time = (datetime.now() - start_time).total_seconds()
-
-        return InferenceResponse(
-            request_id=request_id,
-            timestamp=start_time.isoformat(),
-            image_dimensions={"height": image.shape[0], "width": image.shape[1]},
-            total_detections=len(detections),
-            detections=detection_results,
-            processing_time=total_time,
-            overall_top_probabilities=overall_prob_results,
-            settings={
-                "confidence_threshold": confidence_threshold,
-                "nms_threshold": nms_threshold,
-                "use_tta": use_tta,
-                "top_k": top_k,
-                "species": species_name or "generic",
-            },
-        )
-
-    except Exception as e:
-        logger.error(f"Detection error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    require_detector()
+    result = run_analysis(file.file.read(), file.filename or "image",
+                          request_id or str(uuid.uuid4()), sensitivity, noise_gate)
+    if not result["success"]:
+        raise HTTPException(400 if result["error_type"] == "input" else 500, result["error"])
+    return result
 
 
-# ── HEALTH ────────────────────────────────────────────────────────────────────
-@app.get("/health", response_model=HealthResponse, tags=["Health"])
-async def health_check():
-    return HealthResponse(
-        status="healthy" if bacteria_detector else "partial",
-        detection_model_loaded=bacteria_detector is not None,
-        classifier_model_loaded=classifier_model is not None,
-        device=str(bacteria_detector.device) if bacteria_detector else "none",
-        timestamp=datetime.now().isoformat(),
-    )
+@app.post("/api/v2/analyze/batch", tags=["Analysis"])
+def analyze_batch(
+    files: List[UploadFile] = File(...),
+    sensitivity: float = Form(0.0, ge=-0.2, le=0.3),
+    noise_gate: bool = Form(True),
+):
+    require_detector()
+    if len(files) > MAX_BATCH:
+        raise HTTPException(400, f"At most {MAX_BATCH} images per batch")
+    t0 = time.time()
+    results = [run_analysis(f.file.read(), f.filename or f"image_{i}", str(uuid.uuid4()),
+                            sensitivity, noise_gate)
+               for i, f in enumerate(files)]
+    ok = [r for r in results if r["success"]]
+    return {
+        "success": True,
+        "results": results,
+        "summary": {
+            "images": len(results),
+            "succeeded": len(ok),
+            "failed": len(results) - len(ok),
+            "positive_images": sum(r["bacteria_detected"] for r in ok),
+            "total_detections": sum(r["total_detections"] for r in ok),
+            "processing_time": round(time.time() - t0, 2),
+        },
+    }
+
+
+@app.get("/api/v2/progress/{request_id}", tags=["Analysis"])
+def get_progress(request_id: str):
+    p = progress.get(request_id)
+    if p is None:
+        return {"status": "unknown", "progress": 0.0}
+    return {"status": p["status"], "progress": p["progress"]}
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

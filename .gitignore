@@ -3,3 +3,10 @@ node_modules/
 .DS_Store
 __pycache__/
 *.pyc
+
+# Local datasets, training workspace and model archive (not part of the app)
+HUL project/
+models/
+
+# Build output
+frontend/dist/

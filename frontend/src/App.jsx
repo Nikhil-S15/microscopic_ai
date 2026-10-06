@@ -1,321 +1,243 @@
-// App.jsx — 2-Step Pipeline
-//   Step 1: Upload → classify bacteria species (7-class Keras model)
-//   Step 2: User sees classification result → auto-runs bounding box detection
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { useDropzone } from 'react-dropzone';
+import { UploadCloud } from 'lucide-react';
+import { analyzeImage, fetchModelInfo } from './lib/api';
+import TopBar from './components/TopBar';
+import SettingsDrawer from './components/SettingsDrawer';
+import Dashboard from './components/Dashboard';
+import ReviewView from './components/ReviewView';
+import EmptyState from './components/EmptyState';
 
-import React, { useState, useEffect } from 'react';
-import { Camera, RotateCcw, AlertCircle, Sparkles, ChevronRight, FlaskConical } from 'lucide-react';
-import ResultsDisplay from './components/ResultsDisplay';
-import ClassificationResult from './components/ClassificationResult';
-import './App.css';
+const IMAGE_ACCEPT = { 'image/*': ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp', '.jfif'] };
 
-const API_URL = 'http://localhost:8000';
+const settingsKey = (s) => JSON.stringify([s.sensitivity, s.noiseGate]);
 
-// Pipeline stages
-const STAGE = {
-  IDLE:        'idle',
-  CLASSIFYING: 'classifying',
-  CLASSIFIED:  'classified',
-  DETECTING:   'detecting',
-  DONE:        'done',
-};
+function readTheme() {
+  try { return localStorage.getItem('theme') || 'system'; } catch { return 'system'; }
+}
 
-function App() {
-  const [stage,          setStage]          = useState(STAGE.IDLE);
-  const [image,          setImage]          = useState(null);
-  const [imageFile,      setImageFile]      = useState(null);
-  const [classifyResult, setClassifyResult] = useState(null);
-  const [detectResult,   setDetectResult]   = useState(null);
-  const [error,          setError]          = useState(null);
+export default function App() {
+  const [model, setModel] = useState(null);
+  const [modelError, setModelError] = useState(null);
+  const [items, setItems] = useState([]);
+  const [settings, setSettings] = useState({ sensitivity: 0, noiseGate: true });
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [running, setRunning] = useState(true);
+  const [view, setView] = useState('dashboard');
+  const [selectedId, setSelectedId] = useState(null);
+  const [theme, setTheme] = useState(readTheme);
+  const busy = useRef(false);
+  const abortRef = useRef(null);
 
-  // Review state
-  const [confirmedDetections, setConfirmedDetections] = useState([]);
-  const [removedDetections,   setRemovedDetections]   = useState([]);
-  const [selectedDetection,   setSelectedDetection]   = useState(null);
+  // ── theme ──────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'system') root.removeAttribute('data-theme');
+    else root.setAttribute('data-theme', theme);
+    try { localStorage.setItem('theme', theme); } catch { /* ignore */ }
+  }, [theme]);
 
-  const settings = {
-    confidence: 0.1,
-    nms:        0.3,
-    tta:        true,
-    top_k:      3,
-  };
-
-  // ── Step 1: Classify ────────────────────────────────────────────────────────
-  const runClassify = async (file) => {
-    setStage(STAGE.CLASSIFYING);
-    setError(null);
-
-    try {
-      const form = new FormData();
-      form.append('file', file);
-
-      const res = await fetch(`${API_URL}/api/v1/classify`, {
-        method: 'POST',
-        body: form,
-      });
-
-      if (!res.ok) {
-        let msg = 'Classification failed';
-        try { const d = await res.json(); msg = d.detail || msg; } catch {}
-        throw new Error(msg);
+  // ── model info (retry until the backend is up) ─────────────────────────
+  useEffect(() => {
+    let cancelled = false;
+    let timer;
+    const load = async () => {
+      try {
+        const info = await fetchModelInfo();
+        if (cancelled) return;
+        setModel(info);
+        setModelError(null);
+        if (!info.noise_gate) setSettings((s) => ({ ...s, noiseGate: false }));
+      } catch (e) {
+        if (cancelled) return;
+        setModelError(e.message);
+        timer = setTimeout(load, 3000);
       }
+    };
+    load();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, []);
 
-      const data = await res.json();
-      setClassifyResult(data);
-      setStage(STAGE.CLASSIFIED);
+  const update = useCallback((id, patch) => {
+    setItems((prev) => prev.map((it) => (it.id === id ? { ...it, ...(typeof patch === 'function' ? patch(it) : patch) } : it)));
+  }, []);
 
-      // Auto-run detection after 1.2s so user can see classification first
-      setTimeout(() => runDetect(file), 1200);
-
-    } catch (err) {
-      setError(err.message);
-      setStage(STAGE.IDLE);
-    }
-  };
-
-  // ── Step 2: Detect ──────────────────────────────────────────────────────────
-  const runDetect = async (file) => {
-    setStage(STAGE.DETECTING);
-
-    try {
-      const form   = new FormData();
-      form.append('file', file);
-
-      const params = new URLSearchParams({
-        confidence_threshold: settings.confidence.toString(),
-        nms_threshold:        settings.nms.toString(),
-        use_tta:              settings.tta.toString(),
-        top_k:                settings.top_k.toString(),
-        ...(classifyResult?.predicted_class
-          ? { species_name: classifyResult.predicted_class }
-          : {}),
+  // ── queue: one image at a time (the server uses every core) ────────────
+  useEffect(() => {
+    if (!running || busy.current || !model) return;
+    const next = items.find((it) => it.status === 'queued');
+    if (!next) return;
+    busy.current = true;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const usedSettings = settings;
+    update(next.id, { status: 'analyzing', progress: 0, error: null, startedAt: Date.now() });
+    analyzeImage(next.file, usedSettings, {
+      signal: controller.signal,
+      onProgress: (p) => update(next.id, (it) => (it.status === 'analyzing' ? { progress: p } : {})),
+    })
+      .then((result) => update(next.id, {
+        status: 'done', progress: 1, result, review: {}, settingsKey: settingsKey(usedSettings),
+      }))
+      .catch((err) => update(next.id, err.name === 'AbortError'
+        ? { status: 'queued', progress: 0 }
+        : { status: 'error', error: err.message }))
+      .finally(() => {
+        busy.current = false;
+        abortRef.current = null;
+        setItems((prev) => [...prev]);   // re-run this effect for the next item
       });
+  }, [items, running, settings, model, update]);
 
-      const res = await fetch(`${API_URL}/api/v1/detect?${params}`, {
-        method: 'POST',
-        body: form,
-      });
+  // ── actions ────────────────────────────────────────────────────────────
+  const addFiles = useCallback((files) => {
+    const fresh = files.map((file) => ({
+      id: crypto.randomUUID(),
+      file,
+      url: URL.createObjectURL(file),
+      status: 'queued',
+      progress: 0,
+      result: null,
+      error: null,
+      review: {},
+    }));
+    if (!fresh.length) return;
+    setItems((prev) => [...prev, ...fresh]);
+    setRunning(true);
+  }, []);
 
-      if (!res.ok) {
-        let msg = 'Detection failed';
-        try { const d = await res.json(); msg = d.detail || d.message || msg; } catch {}
-        throw new Error(msg);
-      }
+  const { getRootProps, getInputProps, isDragActive, open: browse } = useDropzone({
+    onDrop: addFiles,
+    accept: IMAGE_ACCEPT,
+    maxSize: (model?.limits.max_image_mb ?? 40) * 1024 * 1024,
+    multiple: true,
+    noClick: true,
+    noKeyboard: true,
+    disabled: !model,
+  });
 
-      const data = await res.json();
-      if (!data.success) throw new Error(data.message || 'Detection failed');
+  const removeItem = useCallback((id) => {
+    setItems((prev) => {
+      const it = prev.find((x) => x.id === id);
+      if (it?.status === 'analyzing') abortRef.current?.abort();
+      if (it) URL.revokeObjectURL(it.url);
+      return prev.filter((x) => x.id !== id);
+    });
+  }, []);
 
-      setDetectResult(data);
-      setStage(STAGE.DONE);
+  const clearAll = useCallback(() => {
+    abortRef.current?.abort();
+    setItems((prev) => { prev.forEach((it) => URL.revokeObjectURL(it.url)); return []; });
+    setSelectedId(null);
+    setView('dashboard');
+  }, []);
 
-    } catch (err) {
-      setError(err.message);
-      // Stay on classified stage so user can still see classification
-      setStage(STAGE.CLASSIFIED);
+  const retry = useCallback((id) => update(id, { status: 'queued', progress: 0, error: null }), [update]);
+
+  const reanalyzeAll = useCallback(() => {
+    setItems((prev) => prev.map((it) => (it.status === 'analyzing' ? it : { ...it, status: 'queued', progress: 0, error: null })));
+    setRunning(true);
+    setSettingsOpen(false);
+  }, []);
+
+  const toggleRunning = useCallback(() => {
+    setRunning((r) => {
+      if (r) abortRef.current?.abort();
+      return !r;
+    });
+  }, []);
+
+  /** Set review state ('confirmed' | 'rejected' | 'pending') for detections of one sample. */
+  const setReview = useCallback((id, detIds, state) => update(id, (it) => {
+    const review = { ...it.review };
+    for (const d of detIds) {
+      if (state === 'pending') delete review[d]; else review[d] = state;
     }
-  };
+    return { review };
+  }), [update]);
 
-  // ── Handle upload ───────────────────────────────────────────────────────────
-  const handleImageUpload = async (file) => {
-    if (!file.type.startsWith('image/')) {
-      setError('Please upload an image file (JPEG, PNG, etc.)');
-      return;
+  const openReview = useCallback((id) => { setSelectedId(id); setView('review'); }, []);
+
+  const doneItems = items.filter((it) => it.status === 'done');
+  useEffect(() => {
+    if (view === 'review' && !doneItems.some((it) => it.id === selectedId)) {
+      if (doneItems.length) setSelectedId(doneItems[0].id); else setView('dashboard');
     }
-    if (file.size > 10 * 1024 * 1024) {
-      setError('Image size should be less than 10MB');
-      return;
-    }
+  }, [view, selectedId, doneItems]);
 
-    // Reset state
-    setConfirmedDetections([]);
-    setRemovedDetections([]);
-    setSelectedDetection(null);
-    setClassifyResult(null);
-    setDetectResult(null);
-    setError(null);
-
-    setImageFile(file);
-    setImage(URL.createObjectURL(file));
-
-    await runClassify(file);
-  };
-
-  const handleReset = () => {
-    if (image) URL.revokeObjectURL(image);
-    setImage(null);
-    setImageFile(null);
-    setClassifyResult(null);
-    setDetectResult(null);
-    setError(null);
-    setStage(STAGE.IDLE);
-    setConfirmedDetections([]);
-    setRemovedDetections([]);
-    setSelectedDetection(null);
-  };
-
-  // ── Review handlers ─────────────────────────────────────────────────────────
-  const confirmDetection = (index) => {
-    setConfirmedDetections(prev => prev.includes(index) ? prev : [...prev, index]);
-    setRemovedDetections(prev => prev.filter(i => i !== index));
-  };
-
-  const removeDetection = (index) => {
-    setRemovedDetections(prev => prev.includes(index) ? prev : [...prev, index]);
-    setConfirmedDetections(prev => prev.filter(i => i !== index));
-    setSelectedDetection(prev => prev?.index === index ? null : prev);
-  };
-
-  const handleDetectionClick = (detection, index) => {
-    setSelectedDetection({ ...detection, index });
-  };
-
-  // ── Render ──────────────────────────────────────────────────────────────────
-  const isLoading = stage === STAGE.CLASSIFYING || stage === STAGE.DETECTING;
+  const staleCount = doneItems.filter((it) => it.settingsKey !== settingsKey(settings)).length;
+  const selected = doneItems.find((it) => it.id === selectedId);
 
   return (
-    <div className="app-container">
-      <header className="app-header">
-        <div className="header-content">
-          <FlaskConical className="header-icon" />
-          <div>
-            <h1 className="header-title">Bacteria Detection System</h1>
-            <p className="header-subtitle">✨ AI-Powered Microscopic Analysis</p>
-          </div>
-        </div>
+    <div {...getRootProps({ className: 'app' })}>
+      <input {...getInputProps()} aria-label="Add microscope images" />
+      <div className="backdrop" aria-hidden="true" />
+      <TopBar
+        model={model}
+        modelError={modelError}
+        theme={theme}
+        onTheme={setTheme}
+        view={view}
+        onView={setView}
+        canReview={doneItems.length > 0}
+        hasItems={items.length > 0}
+        onAdd={browse}
+        onSettings={() => setSettingsOpen(true)}
+        settingsDirty={staleCount > 0}
+      />
 
-        {/* Pipeline progress indicator */}
-        {stage !== STAGE.IDLE && (
-          <div className="pipeline-steps">
-            <div className={`pipeline-step ${stage !== STAGE.IDLE ? 'done-or-active' : ''} ${stage === STAGE.CLASSIFYING ? 'active' : ''}`}>
-              <span className="step-num">1</span>
-              <span className="step-label">Identify Species</span>
-            </div>
-            <ChevronRight size={16} className="step-arrow" />
-            <div className={`pipeline-step ${stage === STAGE.DETECTING || stage === STAGE.DONE ? 'done-or-active' : ''} ${stage === STAGE.DETECTING ? 'active' : ''}`}>
-              <span className="step-num">2</span>
-              <span className="step-label">Detect &amp; Locate</span>
-            </div>
-          </div>
+      <main className="main" id="main">
+        {items.length === 0 ? (
+          <EmptyState model={model} modelError={modelError} onBrowse={browse} />
+        ) : view === 'review' && selected ? (
+          <ReviewView
+            key={selected.id}
+            item={selected}
+            items={doneItems}
+            model={model}
+            onSelect={setSelectedId}
+            onSetReview={setReview}
+            onBack={() => setView('dashboard')}
+          />
+        ) : (
+          <Dashboard
+            items={items}
+            model={model}
+            settings={settings}
+            running={running}
+            staleCount={staleCount}
+            onAdd={browse}
+            onToggleRunning={toggleRunning}
+            onReanalyze={reanalyzeAll}
+            onOpen={openReview}
+            onRemove={removeItem}
+            onRetry={retry}
+            onClear={clearAll}
+          />
         )}
-      </header>
-
-      {error && (
-        <div className="error-banner">
-          <AlertCircle size={24} />
-          <div className="error-content">
-            <p className="error-title">Error</p>
-            <p className="error-message">{error}</p>
-          </div>
-          <button className="error-close" onClick={() => setError(null)}>×</button>
-        </div>
-      )}
-
-      <main className="main-content">
-        <div className="content-wrapper">
-
-          {/* ── IDLE: Upload screen ────────────────────────────────────────── */}
-          {stage === STAGE.IDLE && (
-            <div className="upload-section">
-              <div className="upload-card">
-                <div className="upload-header">
-                  <h2>Upload Microscope Image</h2>
-                  <p>AI will identify the bacteria species, then locate each cell with bounding boxes</p>
-                </div>
-
-                {/* 2-step explainer */}
-                <div className="pipeline-explainer">
-                  <div className="pipe-step">
-                    <div className="pipe-icon step1">🔬</div>
-                    <div>
-                      <strong>Step 1 — Identify</strong>
-                      <p>7-class model names the species with confidence scores</p>
-                    </div>
-                  </div>
-                  <div className="pipe-arrow">→</div>
-                  <div className="pipe-step">
-                    <div className="pipe-icon step2">📦</div>
-                    <div>
-                      <strong>Step 2 — Locate</strong>
-                      <p>Sliding-window CNN draws bounding boxes around each bacterium</p>
-                    </div>
-                  </div>
-                </div>
-
-                <div className="upload-area">
-                  <input
-                    type="file" id="file-upload" accept="image/*"
-                    onChange={e => { if (e.target.files?.[0]) handleImageUpload(e.target.files[0]); }}
-                    style={{ display: 'none' }}
-                  />
-                  <label htmlFor="file-upload" className="upload-label">
-                    <div className="upload-icon"><Camera size={64} /></div>
-                    <p className="upload-title">Click to select image</p>
-                    <p className="upload-subtitle">or drag and drop here</p>
-                    <p className="upload-formats">Supported: JPG, PNG, WebP (max 10MB)</p>
-                  </label>
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* ── CLASSIFYING: Step 1 spinner ───────────────────────────────── */}
-          {stage === STAGE.CLASSIFYING && (
-            <div className="loading-container">
-              <div className="step-badge">Step 1 of 2</div>
-              <div className="spinner spinner-classify"></div>
-              <h2 className="loading-title">Identifying Bacteria Species…</h2>
-              <p className="loading-subtitle">
-                Running 7-class classification on<br />
-                <strong>{imageFile?.name}</strong>
-              </p>
-              {image && <img src={image} alt="preview" className="loading-preview" />}
-            </div>
-          )}
-
-          {/* ── CLASSIFIED: Show result briefly while detect starts ────────── */}
-          {(stage === STAGE.CLASSIFIED || stage === STAGE.DETECTING || stage === STAGE.DONE) && classifyResult && (
-            <ClassificationResult
-              result={classifyResult}
-              detecting={stage === STAGE.DETECTING}
-              detectionDone={stage === STAGE.DONE}
-              imageName={imageFile?.name}
-            />
-          )}
-
-          {/* ── DONE: Full detection results below classification ──────────── */}
-          {stage === STAGE.DONE && image && detectResult && (
-            <div className="detect-section">
-              <div className="detect-header-bar">
-                <h3>🗺 Step 2 — Bounding Box Detection</h3>
-                <span className="detect-count">{detectResult.total_detections} cells found</span>
-                <button className="reset-btn" onClick={handleReset}>
-                  <RotateCcw size={16} /> New Image
-                </button>
-              </div>
-              <ResultsDisplay
-                image={image}
-                results={detectResult}
-                onReset={handleReset}
-                selectedDetection={selectedDetection}
-                onDetectionClick={handleDetectionClick}
-                confirmedDetections={confirmedDetections}
-                removedDetections={removedDetections}
-                onConfirmDetection={confirmDetection}
-                onRemoveDetection={removeDetection}
-              />
-            </div>
-          )}
-
-        </div>
       </main>
 
-      <footer className="app-footer">
-        <div className="footer-content">
-          <p>Bacteria Detection System v2.0 • 2-Step AI Pipeline</p>
-          <p className="footer-note">Identify species → Locate individual cells</p>
+      {model && (
+        <SettingsDrawer
+          open={settingsOpen}
+          onClose={() => setSettingsOpen(false)}
+          model={model}
+          settings={settings}
+          onChange={setSettings}
+          staleCount={staleCount}
+          onReanalyze={reanalyzeAll}
+        />
+      )}
+
+      {isDragActive && (
+        <div className="drop-overlay" aria-hidden="true">
+          <div className="drop-card">
+            <span className="drop-icon"><UploadCloud size={30} /></span>
+            <strong>Drop to add samples</strong>
+            <span>Images are queued and analysed automatically</span>
+          </div>
         </div>
-      </footer>
+      )}
     </div>
   );
 }
-
-export default App;
