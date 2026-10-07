@@ -6,8 +6,14 @@ import { pct } from '../lib/format';
 const STATE_COLOR = { pending: '#22d3ee', confirmed: '#4ade80', rejected: '#94a3b8' };
 const STATE_LABEL = { pending: 'Awaiting review', confirmed: 'Confirmed', rejected: 'Rejected' };
 
-export default function Inspector({ item, progress, selected, onSetState, showRejected, onToggleRejected }) {
+export default function Inspector({
+  item, progress, selected, onSetState, showRejected, onToggleRejected, showRemoved, onToggleRemoved, showMasks, onToggleMasks,
+}) {
   const { result, review } = item;
+  const sc = result.screening;
+  const removedNoise = sc?.removed_noise ?? 0;
+  const removedMask = sc?.removed_mask ?? 0;
+  const hasMasks = result.detections.some((d) => d.mask) || (result.removed ?? []).some((d) => d.mask);
   const state = selected ? review[selected.id] ?? 'pending' : null;
   const reviewed = progress.total - progress.pending;
 
@@ -44,6 +50,8 @@ export default function Inspector({ item, progress, selected, onSetState, showRe
               </dd>
               <dt>Size</dt><dd>{selected.bbox[2] - selected.bbox[0]} × {selected.bbox[3] - selected.bbox[1]} px</dd>
               <dt>Position</dt><dd>x {selected.bbox[0]}, y {selected.bbox[1]}</dd>
+              {selected.noise_score != null && <><dt>Noise probability</dt><dd>{pct(selected.noise_score, 1)}</dd></>}
+              {selected.mask && <><dt>Mask coverage</dt><dd>{pct(selected.mask.coverage, 1)}</dd></>}
             </dl>
             <div className="decide">
               <button className={`btn decide-btn confirm ${state === 'confirmed' ? 'on' : ''}`} onClick={() => onSetState(selected.id, 'confirmed')}>
@@ -67,6 +75,23 @@ export default function Inspector({ item, progress, selected, onSetState, showRe
         )}
       </section>
 
+      {sc && (
+        <section>
+          <h3 className="legend-title">Screening</h3>
+          <ol className="funnel">
+            <li><span>Boxes detected</span><strong>{sc.boxes_detected}</strong></li>
+            <li className={sc.box_screening ? '' : 'off'}><span>Removed as noise</span><strong>{sc.box_screening ? (removedNoise ? `−${removedNoise}` : '0') : 'off'}</strong></li>
+            <li className={sc.sam_verify ? '' : 'off'}><span>Removed by mask check</span><strong>{sc.sam_verify ? (removedMask ? `−${removedMask}` : '0') : 'off'}</strong></li>
+            <li className="total"><span>Kept for review</span><strong>{sc.kept}</strong></li>
+          </ol>
+          <p className="fine-print">
+            Threshold {sc.threshold ?? 'model defaults'}
+            {sc.box_screening && <> · noise &gt; {sc.noise_cutoff}</>}
+            {sc.sam_verify && <> · mask coverage ≥ {Math.round(sc.min_coverage * 100)}%</>}
+          </p>
+        </section>
+      )}
+
       <section>
         <h3 className="legend-title">Legend</h3>
         <ul className="legend">
@@ -76,6 +101,18 @@ export default function Inspector({ item, progress, selected, onSetState, showRe
             <span className="lg-box rejected" /> Rejected
             <button className="link-btn" onClick={onToggleRejected}>{showRejected ? 'Hide' : 'Show'}</button>
           </li>
+          {hasMasks && (
+            <li>
+              <span className="lg-mask" /> Object mask
+              <button className="link-btn" onClick={onToggleMasks}>{showMasks ? 'Hide' : 'Show'}</button>
+            </li>
+          )}
+          {removedNoise + removedMask > 0 && (
+            <li>
+              <span className="lg-box removed" /> Removed by screening ({removedNoise + removedMask})
+              <button className="link-btn" onClick={onToggleRemoved}>{showRemoved ? 'Hide' : 'Show'}</button>
+            </li>
+          )}
         </ul>
       </section>
     </aside>

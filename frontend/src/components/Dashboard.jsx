@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
-  Activity, ChevronDown, ChevronRight, Download, FileSpreadsheet, ImagePlus, Info, Pause, Play,
+  Activity, ChevronDown, ChevronRight, Download, FileArchive, FileSpreadsheet, ImagePlus, Info, Pause, Play,
   RotateCw, ShieldAlert, ShieldCheck, Target, Trash2, X, Microscope, Loader2,
 } from 'lucide-react';
 import ResultBadge from './ResultBadge';
@@ -8,12 +8,14 @@ import ConfidenceRing from './ConfidenceRing';
 import ConfidenceHistogram from './ConfidenceHistogram';
 import Pipeline from './Pipeline';
 import { num, pct, reviewProgress, sampleMetrics, seconds } from '../lib/format';
-import { exportDetectionsCsv, exportSummaryCsv } from '../lib/export';
+import { exportDetectionsCsv, exportMasksZip, exportSummaryCsv } from '../lib/export';
 
 const SENS_LABEL = { '-0.05': 'Strict', 0: 'Balanced', 0.1: 'Sensitive' };
 
 function ExportMenu({ disabled, items }) {
   const [open, setOpen] = useState(false);
+  const [maskError, setMaskError] = useState(null);
+  const withMasks = items.filter((it) => it.status === 'done' && it.result.screening?.masks_saved);
   const ref = useRef(null);
   useEffect(() => {
     if (!open) return undefined;
@@ -37,6 +39,21 @@ function ExportMenu({ disabled, items }) {
           <button role="menuitem" onClick={() => { exportDetectionsCsv(items); setOpen(false); }}>
             <Target size={16} />
             <span><strong>Detection list</strong><small>Every location and confidence · CSV</small></span>
+          </button>
+          <button
+            role="menuitem"
+            disabled={!withMasks.length}
+            onClick={async () => {
+              setMaskError(null);
+              try { await exportMasksZip(withMasks); setOpen(false); } catch (e) { setMaskError(e.message); }
+            }}
+          >
+            <FileArchive size={16} />
+            <span>
+              <strong>Object masks</strong>
+              <small>{withMasks.length ? `Masks + screening log for ${withMasks.length} sample${withMasks.length > 1 ? 's' : ''} · ZIP` : 'Needs mask verification on'}</small>
+              {maskError && <small className="error-text">{maskError}</small>}
+            </span>
           </button>
         </div>
       )}
@@ -162,14 +179,16 @@ export default function Dashboard({
         <div className="col-side">
           <section className="card">
             <div className="card-head"><h2><Microscope size={16} /> Detection process</h2></div>
-            <Pipeline items={items} running={running} noiseGate={settings.noiseGate} avgTime={avgTime} />
+            <Pipeline items={items} running={running} settings={settings} samAvailable={!!model?.screening?.sam.available} avgTime={avgTime} />
           </section>
 
           <section className="card info-card">
             <div className="card-head"><h2><Info size={16} /> Supporting information</h2></div>
             <dl className="facts">
               <dt>Model</dt><dd>{model?.architecture ?? '—'}</dd>
-              <dt>Sensitivity</dt><dd>{SENS_LABEL[String(settings.sensitivity)] ?? 'Custom'}</dd>
+              <dt>Threshold</dt><dd>{settings.threshold != null ? `Fixed · ${settings.threshold}` : `Defaults · ${SENS_LABEL[String(settings.sensitivity)] ?? 'Custom'}`}</dd>
+              <dt>Noise screening</dt><dd>{settings.boxScreening ? `On · > ${settings.noiseCutoff}` : 'Off'}</dd>
+              <dt>Mask verification</dt><dd>{settings.samVerify && model?.screening?.sam.available ? `On · ≥ ${Math.round(settings.minCoverage * 100)}%` : 'Off'}</dd>
               <dt>Compute</dt><dd>{model?.device.toUpperCase() ?? '—'}</dd>
             </dl>
             <p className="fine-print">

@@ -1,5 +1,5 @@
 import React from 'react';
-import { LayoutDashboard, Microscope, Monitor, Moon, Plus, ScanSearch, SlidersHorizontal, Sun } from 'lucide-react';
+import { ChartSpline, LayoutDashboard, Microscope, Monitor, Moon, Plus, ScanSearch, SlidersHorizontal, Sun } from 'lucide-react';
 
 const THEMES = [
   { id: 'light', icon: Sun, label: 'Light' },
@@ -35,6 +35,9 @@ export default function TopBar({
           </button>
           <button className={view === 'review' ? 'active' : ''} onClick={() => onView('review')} disabled={!canReview}>
             <ScanSearch size={15} /> <span>Review</span>
+          </button>
+          <button className={view === 'thresholds' ? 'active' : ''} onClick={() => onView('thresholds')} disabled={!canReview}>
+            <ChartSpline size={15} /> <span>Thresholds</span>
           </button>
         </nav>
       )}

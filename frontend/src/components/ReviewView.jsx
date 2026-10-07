@@ -25,6 +25,8 @@ export default function ReviewView({ item, items, model, onSelect, onSetReview, 
   const [tab, setTab] = useState(readTab);
   const [filter, setFilter] = useState('all');
   const [showRejected, setShowRejected] = useState(true);
+  const [showRemoved, setShowRemoved] = useState(false);
+  const [showMasks, setShowMasks] = useState(true);
   const [selectedId, setSelectedId] = useState(null);
   const [exporting, setExporting] = useState(false);
   const [showKeys, setShowKeys] = useState(false);
@@ -204,6 +206,9 @@ export default function ReviewView({ item, items, model, onSelect, onSetReview, 
               selectedId={selectedId}
               onSelect={(id) => select(id, false)}
               showRejected={showRejected}
+              removed={result.removed ?? []}
+              showRemoved={showRemoved}
+              showMasks={showMasks}
             />
           </div>
           <Inspector
@@ -213,6 +218,10 @@ export default function ReviewView({ item, items, model, onSelect, onSetReview, 
             onSetState={decide}
             showRejected={showRejected}
             onToggleRejected={() => setShowRejected((v) => !v)}
+            showRemoved={showRemoved}
+            onToggleRemoved={() => setShowRemoved((v) => !v)}
+            showMasks={showMasks}
+            onToggleMasks={() => setShowMasks((v) => !v)}
           />
         </div>
       ) : (

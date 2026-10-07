@@ -51,6 +51,10 @@ MIN_VOTES  = 2
 # keep only the more confident one (one label per organism).
 CROSS_SPECIES_IOU = 0.40
 
+# Lowest window confidence kept as a candidate, so results can be recomputed at
+# any threshold from here up without re-running the model (threshold analysis).
+CANDIDATE_FLOOR = 0.50
+
 # Display metadata + detection settings per class code. Thresholds follow
 # unified_detect_all_species.py. Colours are a CVD-checked categorical set.
 SPECIES_CFG: Dict[str, Dict] = {
@@ -216,6 +220,17 @@ def resolve_cross_species(dets: List[Dict]) -> List[Dict]:
     return keep
 
 
+def post_process(candidates: Dict[str, List[Dict]], thr: Dict[str, float]) -> List[Dict]:
+    """Candidate windows → final boxes at the given per-species thresholds."""
+    final: List[Dict] = []
+    for c, wins in candidates.items():
+        kept = [d for d in wins if d["confidence"] >= thr[c]]
+        final.extend(merge_clusters(kept, SPECIES_CFG[c]["patch_size"] * MERGE_LINK, MIN_VOTES))
+    final = resolve_cross_species(final)
+    final.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
+    return final
+
+
 # ══════════════════════════════════════════════════════════════
 # DETECTOR
 # ══════════════════════════════════════════════════════════════
@@ -375,14 +390,15 @@ class UnifiedDetector:
             if progress_cb and n_classify:
                 progress_cb((done_before + done_in_plan) / n_classify)
 
-        # pass 2: batched classification
-        raw: Dict[str, List[Dict]] = {c: [] for c in active}
+        # pass 2: batched classification. Windows are kept down to CANDIDATE_FLOOR
+        # (below the detection threshold) so post_process can re-run at any threshold.
+        candidates: Dict[str, List[Dict]] = {c: [] for c in active}
         for ps, codes, Y, X, crops, gated in plans:
             probs = self._classify(crops, report)
             done_before += len(crops)
             for c in codes:
                 p = probs[:, self.class_idx[c]] if len(crops) else np.zeros(0)
-                hit = p >= thr[c]
+                hit = p >= min(thr[c], CANDIDATE_FLOOR)
                 if not SPECIES_CFG[c].get("skip_noise_gate"):
                     hit &= ~gated
                 # a crop gets the label of its most likely class only
@@ -390,17 +406,12 @@ class UnifiedDetector:
                     hit &= probs.argmax(1) == self.class_idx[c]
                 for i in np.flatnonzero(hit):
                     x, y = int(X[i]), int(Y[i])
-                    raw[c].append({"bbox": [x, y, x + ps, y + ps],
-                                   "confidence": float(p[i]), "code": c})
+                    candidates[c].append({"bbox": [x, y, x + ps, y + ps],
+                                          "confidence": float(p[i]), "code": c})
 
         # pass 3: merge windows into one box per organism, then one label per organism
-        final: List[Dict] = []
-        raw_counts = {}
-        for c in active:
-            raw_counts[c] = len(raw[c])
-            final.extend(merge_clusters(raw[c], SPECIES_CFG[c]["patch_size"] * MERGE_LINK, MIN_VOTES))
-        final = resolve_cross_species(final)
-        final.sort(key=lambda d: (d["bbox"][1], d["bbox"][0]))
+        final = post_process(candidates, thr)
+        raw_counts = {c: sum(d["confidence"] >= thr[c] for d in candidates[c]) for c in active}
 
         counts = {c: 0 for c in active}
         conf_sum = {c: 0.0 for c in active}
@@ -436,4 +447,6 @@ class UnifiedDetector:
             },
             "image": {"width": w, "height": h},
             "processing_time": round(elapsed, 3),
+            # internal: for post_process at other thresholds (not part of the API)
+            "candidates": candidates,
         }

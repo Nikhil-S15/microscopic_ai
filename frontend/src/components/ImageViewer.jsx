@@ -4,13 +4,15 @@ import { Maximize, Minus, Plus } from 'lucide-react';
 const MAX_SCALE = 8;
 const STATE_COLOR = { pending: '#22d3ee', confirmed: '#4ade80', rejected: '#94a3b8' };
 const STATE_LABEL = { pending: 'Awaiting review', confirmed: 'Confirmed', rejected: 'Rejected' };
+export const REMOVED_LABEL = { noise: 'Removed · noise', mask: 'Removed · no object in mask' };
+const pts = (c) => c.map((p) => p.join(',')).join(' ');
 
 /**
  * Zoom/pan image stage with an SVG detection overlay.
  * Detection coordinates are natural image pixels; colour encodes review state.
  */
 const ImageViewer = forwardRef(function ImageViewer(
-  { src, width, height, detections, review, selectedId, onSelect, showRejected = true },
+  { src, width, height, detections, review, selectedId, onSelect, showRejected = true, removed = [], showRemoved = false, showMasks = true },
   ref,
 ) {
   const stageRef = useRef(null);
@@ -128,12 +130,33 @@ const ImageViewer = forwardRef(function ImageViewer(
           <div className="stage-content" style={{ width, height, transform: `translate(${view.x}px, ${view.y}px) scale(${view.s})` }}>
             <img src={src} alt="Microscope field of view" draggable={false} width={width} height={height} />
             <svg className="overlay" viewBox={`0 0 ${width} ${height}`} width={width} height={height}>
+              {showRemoved && removed.map((d, i) => {
+                const [x1, y1, x2, y2] = d.bbox;
+                return (
+                  <g key={`r${i}`} className={`removed-box ${d.stage}`}>
+                    {d.mask?.contour?.length > 2 && <polygon points={pts(d.mask.contour)} className="removed-mask" strokeWidth={1.2 / scale} />}
+                    <rect
+                      x={x1} y={y1} width={x2 - x1} height={y2 - y1} strokeWidth={1.6 / scale}
+                      strokeDasharray={`${5 / scale} ${4 / scale}`}
+                      onPointerEnter={(e) => {
+                        if (drag.current?.moved) return;
+                        const r = stageRef.current.getBoundingClientRect();
+                        setHover({ det: d, removed: true, px: e.clientX - r.left, py: e.clientY - r.top });
+                      }}
+                      onPointerLeave={() => setHover((h0) => (h0?.det === d ? null : h0))}
+                    />
+                  </g>
+                );
+              })}
+              {showMasks && shown.map((d) => d.mask?.contour?.length > 2 && (
+                <polygon key={`m${d.id}`} points={pts(d.mask.contour)} className={`mask-outline ${review[d.id] ?? 'pending'}`} strokeWidth={1.4 / scale} />
+              ))}
               {shown.map((d) => {
                 const [x1, y1, x2, y2] = d.bbox;
                 const state = review[d.id] ?? 'pending';
                 const color = STATE_COLOR[state];
                 const isSel = selectedId === d.id;
-                const isHover = hover?.det.id === d.id;
+                const isHover = !hover?.removed && hover?.det.id === d.id;
                 const w = x2 - x1, h = y2 - y1;
                 const sw = (isSel || isHover ? 3.5 : 2) / scale;
                 const showTag = w * scale > 40 || isSel;
@@ -154,7 +177,7 @@ const ImageViewer = forwardRef(function ImageViewer(
                         const r = stageRef.current.getBoundingClientRect();
                         setHover({ det: d, px: e.clientX - r.left, py: e.clientY - r.top });
                       }}
-                      onPointerLeave={() => setHover((h0) => (h0?.det.id === d.id ? null : h0))}
+                      onPointerLeave={() => setHover((h0) => (!h0?.removed && h0?.det.id === d.id ? null : h0))}
                     />
                     {showTag && state !== 'rejected' && (
                       <g transform={`translate(${x1} ${y1}) scale(${1 / scale})`} className="tag-g">
@@ -171,10 +194,12 @@ const ImageViewer = forwardRef(function ImageViewer(
 
         {hover && (
           <div className="tooltip floating" role="tooltip" style={{ left: hover.px + 14, top: hover.py + 14 }}>
-            <span className="tt-title">Detection #{hover.det.id + 1}</span>
+            <span className="tt-title">{hover.removed ? REMOVED_LABEL[hover.det.stage] : `Detection #${hover.det.id + 1}`}</span>
             <span className="tt-row"><span>Confidence</span><strong>{(hover.det.confidence * 100).toFixed(1)}%</strong></span>
             <span className="tt-row"><span>Size</span><strong>{hover.det.bbox[2] - hover.det.bbox[0]} × {hover.det.bbox[3] - hover.det.bbox[1]} px</strong></span>
-            <span className="tt-row"><span>Status</span><strong>{STATE_LABEL[review[hover.det.id] ?? 'pending']}</strong></span>
+            {hover.det.noise_score != null && <span className="tt-row"><span>Noise probability</span><strong>{(hover.det.noise_score * 100).toFixed(1)}%</strong></span>}
+            {hover.det.mask && <span className="tt-row"><span>Mask coverage</span><strong>{(hover.det.mask.coverage * 100).toFixed(1)}%</strong></span>}
+            {!hover.removed && <span className="tt-row"><span>Status</span><strong>{STATE_LABEL[review[hover.det.id] ?? 'pending']}</strong></span>}
           </div>
         )}
       </div>

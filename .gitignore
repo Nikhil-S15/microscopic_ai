@@ -10,3 +10,10 @@ models/
 
 # Build output
 frontend/dist/
+
+# Saved masks and screening log (generated per analysis)
+backend/outputs/
+
+# MicroSAM weights (375 MB, over GitHub's file limit) — fetch with:
+#   python backend/scripts/download_sam.py
+backend/app/model/microsam_vit_b_lm.pt

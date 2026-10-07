@@ -7,10 +7,24 @@ import SettingsDrawer from './components/SettingsDrawer';
 import Dashboard from './components/Dashboard';
 import ReviewView from './components/ReviewView';
 import EmptyState from './components/EmptyState';
+import ThresholdAnalysis, { initialThresholdState } from './components/ThresholdAnalysis';
 
 const IMAGE_ACCEPT = { 'image/*': ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff', '.webp', '.jfif'] };
 
-const settingsKey = (s) => JSON.stringify([s.sensitivity, s.noiseGate]);
+const settingsKey = (s) => JSON.stringify([
+  s.sensitivity, s.noiseGate, s.threshold, s.boxScreening, s.noiseCutoff, s.samVerify, s.maskThreshold, s.minCoverage,
+]);
+
+const DEFAULT_SETTINGS = {
+  sensitivity: 0,
+  noiseGate: true,
+  threshold: null,        // one confidence threshold for every detection; null = model defaults
+  boxScreening: true,     // stage 2 · noise model on every box
+  noiseCutoff: 0.5,
+  samVerify: true,        // stage 3 · SAM mask check
+  maskThreshold: 0,
+  minCoverage: 0.1,
+};
 
 function readTheme() {
   try { return localStorage.getItem('theme') || 'system'; } catch { return 'system'; }
@@ -20,12 +34,13 @@ export default function App() {
   const [model, setModel] = useState(null);
   const [modelError, setModelError] = useState(null);
   const [items, setItems] = useState([]);
-  const [settings, setSettings] = useState({ sensitivity: 0, noiseGate: true });
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [running, setRunning] = useState(true);
   const [view, setView] = useState('dashboard');
   const [selectedId, setSelectedId] = useState(null);
   const [theme, setTheme] = useState(readTheme);
+  const [thresholdState, setThresholdState] = useState(initialThresholdState);
   const busy = useRef(false);
   const abortRef = useRef(null);
 
@@ -47,7 +62,13 @@ export default function App() {
         if (cancelled) return;
         setModel(info);
         setModelError(null);
-        if (!info.noise_gate) setSettings((s) => ({ ...s, noiseGate: false }));
+        const sc = info.screening;
+        setSettings((s) => ({
+          ...s,
+          noiseGate: info.noise_gate ? s.noiseGate : false,
+          boxScreening: sc?.box_screening ? s.boxScreening : false,
+          samVerify: sc?.sam.available ? s.samVerify : false,
+        }));
       } catch (e) {
         if (cancelled) return;
         setModelError(e.message);
@@ -189,6 +210,17 @@ export default function App() {
       <main className="main" id="main">
         {items.length === 0 ? (
           <EmptyState model={model} modelError={modelError} onBrowse={browse} />
+        ) : view === 'thresholds' ? (
+          <ThresholdAnalysis
+            items={items}
+            model={model}
+            state={thresholdState}
+            setState={setThresholdState}
+            onReanalyze={reanalyzeAll}
+            appliedThreshold={settings.threshold}
+            onApplyThreshold={(t) => setSettings((s) => ({ ...s, threshold: t }))}
+            staleCount={staleCount}
+          />
         ) : view === 'review' && selected ? (
           <ReviewView
             key={selected.id}

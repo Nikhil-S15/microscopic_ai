@@ -1,4 +1,5 @@
 import { reviewProgress, reviewState, sampleMetrics } from './format';
+import { downloadMasksZip } from './api';
 
 function download(name, blob) {
   const url = URL.createObjectURL(blob);
@@ -28,10 +29,12 @@ export function exportDetectionsCsv(items) {
 }
 
 export function exportSummaryCsv(items) {
-  const rows = [['sample', 'status', 'result', 'detections', 'mean_confidence', 'max_confidence', 'coverage', 'confirmed', 'rejected', 'pending', 'processing_s']];
+  const rows = [['sample', 'status', 'result', 'detections', 'mean_confidence', 'max_confidence', 'coverage', 'confirmed', 'rejected', 'pending',
+    'threshold', 'boxes_detected', 'removed_noise', 'removed_mask', 'processing_s']];
   for (const it of items) {
     const m = sampleMetrics(it);
     const p = reviewProgress(it);
+    const sc = it.result?.screening;
     rows.push([
       it.file.name, it.status,
       m ? (m.detected ? 'Bacteria detected' : 'No bacteria detected') : '',
@@ -40,10 +43,26 @@ export function exportSummaryCsv(items) {
       m?.maxConfidence?.toFixed(4) ?? '',
       m ? m.coverage.toFixed(6) : '',
       m ? p.confirmed : '', m ? p.rejected : '', m ? p.pending : '',
+      sc ? (sc.threshold ?? 'defaults') : '', sc?.boxes_detected ?? '', sc?.removed_noise ?? '', sc?.removed_mask ?? '',
       it.result?.processing_time ?? '',
     ]);
   }
   download(`batch_summary_${stamp()}.csv`, new Blob([toCsv(rows)], { type: 'text/csv' }));
+}
+
+export function exportThresholdCsv(analysis, bestIndex) {
+  const f = (v) => (v == null ? '' : v.toFixed(4));
+  const rows = [['threshold', 'precision', 'recall', 'f1', 'detections', 'correct_detections', 'objects_found', 'labelled_objects', 'selected']];
+  analysis.results.forEach((r, i) => rows.push([
+    r.threshold, f(r.precision), f(r.recall), f(r.f1), r.detections, r.correct_detections,
+    r.objects_found, analysis.objects, i === bestIndex ? 'yes' : '',
+  ]));
+  download(`threshold_analysis_${stamp()}.csv`, new Blob([toCsv(rows)], { type: 'text/csv' }));
+}
+
+export async function exportMasksZip(items) {
+  const blob = await downloadMasksZip(items.map((it) => ({ request_id: it.result.request_id, name: it.file.name })));
+  download(`masks_${stamp()}.zip`, blob);
 }
 
 /** Render the image with every non-rejected box burned in, and download as PNG. */
